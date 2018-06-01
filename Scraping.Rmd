@@ -1,0 +1,778 @@
+---
+title: "Scraping"
+author: "Kenneth Enevoldsen & Dana Jensen"
+date: "4/26/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#load packages
+```{r}
+#_____________________________________________________________________________________#
+#_______________________________SET WD AND LOAD PACKAGES______________________________#
+#_____________________________________________________________________________________#
+setwd("/Users/kennethenevoldsen/Desktop/Github/Statistic R/Beers and Bitcoin/BeersAndBitcoin")
+library(pacman) 
+p_load(stringr, dplyr, RedditExtractoR, tidytext, ggplot2, boilerpipeR, RCurl, rvest, httr, jsonlite, RSelenium, beepr, lubridate, reshape2, patchwork)
+```
+
+#SENTIMENT ANALYSIS USING LAPMT
+```{r}
+#_____________________________________________________________________________________#
+#___________________________SENTIMENT ANALYSIS USING LABMT____________________________#
+#_____________________________________________________________________________________#
+
+
+#___________________________DEFINING A SCORING FUNCTION____________________________#
+
+LabMT_score <- function(text, stopwords = T, method = "MSS"){ 
+  #text: the input text as a string
+  #stopwords: should the function remove stopwords, this makes it computationally easier
+  #method: "MSS" for a mean sentiment score (sentiment score/number of words). "ASS" for absolute sentiment score
+  #OBS! this function requires that you have the labmt_dict.csv on your computer
+  
+  text_df <- data.frame(text = text) #make it into a df
+  text_df$text <- as.character(text_df$text) #making it into string (in the case it would be a factor)
+  
+  #loading the labMT dictionary - this can also be done using the tidytext::get_sentiments(), but it doesn't yet support labMT (but they are working on it)
+  labmt_dict <- read.delim("labmt_dict.csv") %>% select(word, happiness_average)
+  #labmt_dict$happiness_average <- labmt_dict$happiness_average - mean(labmt_dict$happiness_average) #center the happiness scores
+  
+    #tokenize
+  tokens <- text_df %>% #tokenize the text (removing non text objects, lowercasing and splitting it into individual words)
+    unnest_tokens(word, text)
+  
+    #remove stopwords?
+  if (stopwords == T){
+    tokens <- tokens %>% #removing stopwords according to a dictionary
+      anti_join(get_stopwords(language = "en", source = "snowball"))
+  }
+
+    #score
+  unique_tokens <- tokens %>% count(word) %>% left_join(., labmt_dict) #count and score
+  unique_tokens$happiness_average[is.na(unique_tokens$happiness_average)] = 0 #replace NA's with 0
+  if (method == "MSS"){
+      SS <- sum(unique_tokens$happiness_average*unique_tokens$n)/sum(unique_tokens$n) #calculating the mean sentiment score (MSS) for the entire text
+  } else if (method == "ASS"){
+    SS <- sum(unique_tokens$happiness_average*unique_tokens$n) #calculating the absolute sentiment score (ASS) for the entire text
+  }
+  else {
+    stop('Wrong input for method, use either "MSS" or "ASS"')
+  }
+  
+  return(SS) #return sentiment score (MSS or ASS)
+  }
+```
+
+#SCRAPING COINDESK
+```{r}
+#_____________________________________________________________________________________#
+#__________________________________SCRAPING COINDESK__________________________________#
+#_____________________________________________________________________________________#
+
+
+#__________________________________CREATING SEARCH LINK__________________________________#
+page_total <- 999 #999 because it seems to be the max for their homepage - ideally this should be extracted.
+search_terms <- c("bitcoin", "cryptocurrency", "cryptocurrencies")
+
+#creating all pages to search for (all pages for all search terms)
+for (search_term in search_terms){
+  print(search_term)#checking whether is works
+  
+  #constructing all the links
+  temp_links <- paste("https://www.coindesk.com/page/", seq(1, page_total), "/?s=", search_term, sep = "")
+
+    #check if link is relevant:
+  no_data = T 
+  page_count = page_total
+  while (no_data == T) {
+    print(page_count) #check if it works
+    webpage_check <- try(read_html(temp_links[page_count])) #check the last 
+    
+      #if page wasn't found move on to the next one:
+    if (webpage_check[1] == "Error in open.connection(x, \"rb\") : HTTP error 404.\n"){
+      page_count = page_count-1
+      next
+    }
+    
+    temp <- webpage_check %>% html_nodes("p")
+    
+     #if there is no articles check the next otherwise move on:
+    if (as.character(temp[1]) == "<p>Sorry, we couldn't find anything matching your search.</p>"){
+      page_count = page_count-1
+      next
+    } 
+
+  temp_links <- temp_links[1:page_count] #limit the links to only those with data
+  page_count = page_count-1
+  no_data = F
+  }
+    #constructing list of all the links
+  if (search_term == search_terms[1]){ #if it is the first one create the list
+    links <- temp_links
+  } else { #otherwise append to it
+    links <- c(links, temp_links)
+  }
+}
+
+length(links) #checking whether links is shorter than 2997 indicating that some of the links were excluded
+
+#__________________________________SCRAPING ARTICLE LINKS__________________________________#
+for (link in links){ #loop through all the pages (links) to get all of the article links
+  print(paste("Progress:", match(link, links), "/", length(links)))
+  webpage <- read_html(link) #read the html
+  Article_links <- webpage %>% html_nodes(".fade") %>% html_attr('href') #extract the article links
+  Article_links <- unique(Article_links[1:(length(Article_links)-4)]) #removing doublicate links as well as featured articles (the last four in the list)
+  Article_dates <- webpage %>% html_nodes("time") #extract article date
+
+  #if the link is the first one make a dataframe otherwise append to it:
+  temp_df <- try(data.frame(date_string = as.character(Article_dates), Article_link = Article_links, stringsAsFactors = F))
+  if (is.data.frame(temp_df) == F){next}
+  if (link == links[1]){
+    article_df <- temp_df
+  } else {
+    article_df <- rbind(article_df, temp_df)
+  }
+}
+
+#looping over remaining links - this is if the connection is broken
+nrow(article_df)/10
+links_remaining <- links[(nrow(article_df)/10+1):length(links)]
+
+for (link in links_remaining){ #loop through all the pages (links) to get all of the article links
+  print(paste("Progress:", match(link, links), "/", length(links)))
+  webpage <- read_html(link) #read the html
+  Article_links <- webpage %>% html_nodes(".fade") %>% html_attr('href') #extract the article links
+  Article_links <- unique(Article_links[1:(length(Article_links)-4)]) #removing doublicate links as well as featured articles (the last four in the list)
+  Article_dates <- webpage %>% html_nodes("time") #extract article date
+
+  #if the link is the first one make a dataframe otherwise append to it:
+  temp_df <- try(data.frame(date_string = as.character(Article_dates), Article_link = Article_links, stringsAsFactors = F))
+  if (is.data.frame(temp_df) == F){next}
+  article_df <- rbind(article_df, temp_df)
+}
+
+  #check if there is duplicates
+length(article_df$Article_link)
+length(unique(article_df$Article_link))
+article_df <- unique(article_df) #removing duplicates due to multiple searches 
+
+
+#______________________________EXTRACTING DATES FROM DATE STRING_____________________________#
+
+  #defining function to extract dates
+extract_date = function(string){
+  date_string <- gsub("T.*","",string) #removing everthing after the T (including the T)
+  date_string <- gsub('.*"',"",date_string) #remove everything before the ' " '
+  date_split <- unlist(str_split(date_string, "-"))
+  date_string <- c(date_split, date_string)
+  return(date_string)
+}
+  #applying function to df
+extract_date(string = article_df$date[1])
+article_df$year <- sapply(article_df$date, function(x) extract_date(x)[1])
+article_df$month <- sapply(article_df$date, function(x) extract_date(x)[2]) 
+article_df$day <- sapply(article_df$date, function(x) extract_date(x)[3]) 
+article_df$date <- sapply(article_df$date, function(x) extract_date(x)[4]) 
+
+
+article_df$date <- as.Date(article_df$date)
+
+#______________________________SCRAPING ARTICLES_____________________________#
+for (i in 1:length(article_df$Article_link)){  #should be 1:length(article_df$Article_link) - but using 1:1000 for testing
+  #create columns during first run through
+  if (i == 1){ 
+    article_df$bodytext = NA
+    article_df$title = NA
+    article_df$comments = NA
+    article_df$type = "article"
+  }
+  
+  #print progress
+  print(paste("Progress:", i, "/", length(article_df$Article_link)))
+  
+  #Extract variables including bodytext, title and comments #!# in this case the comments does not seem to work
+  bodytext <- article_df$Article_link[i] %>% 
+    read_html() %>% 
+    html_nodes(".single-content") %>% 
+    html_text()
+  title <- article_df$Article_link[i] %>% 
+    read_html() %>% 
+    html_nodes(".article-top-title") %>% 
+    html_text()
+  comments <- article_df$Article_link[i] %>% 
+    read_html() %>% 
+    html_nodes("#comments") %>% 
+    html_text()
+  
+  #if it is not an article
+  if (identical(title, character(0)) == T){
+    article_df$type[i] = "other"
+    next
+  }
+  
+  #save variables
+  article_df$bodytext[i] <- bodytext
+  article_df$title[i] <- title
+  article_df$comments[i] <- comments
+} 
+
+nrow(article_df[complete.cases(article_df$bodytext),])
+sum(article_df$type == "other")
+
+
+#______________________________SCORING AND MANIPULATING DATA_____________________________#
+
+article_df_raw <- article_df
+
+#removing incomplete cases
+article_df <- na.omit(article_df)
+
+article_df_singledate <- article_df %>% #make it so that there is only one row pr. date
+    group_by(date) %>% 
+    summarise(bodytexts = paste(bodytext, collapse = ', '), titles = paste(title, collapse = ', '))
+
+  #score the articles
+article_df$MSS <- sapply(article_df$bodytext, LabMT_score)
+article_df_singledate$MSS <- sapply(article_df_singledate$bodytexts, LabMT_score)
+
+
+#_________________________________PLOTS_________________________________#
+PLOT_CD_MSS <- ggplot(article_df_singledate, aes(x = date, y = MSS)) +  geom_bar(stat = "identity") + labs(title = "MSS on CoinDesk using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Days after 01_01_2013", y = "Mean Sentiment Score (MSS)")
+
+PLOT_CD_MSS.c <- ggplot(article_df_singledate, aes(x = date, y = MSS-mean(MSS))) +  geom_bar(stat = "identity") + labs(title = "MSS on CoinDesk using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Days after 01_01_2013", y = "Mean Sentiment Score (MSS) - Centered")
+
+
+#______________________________EXPORTING DATA_____________________________#
+#write.csv(article_df_raw, "CoindeskData_raw.csv", row.names = F)
+#write.csv(article_df, "CoindeskData.csv", row.names = F) #contains all the raw data scraped from Coindesk
+#write.csv(article_df_singledate, "CoindeskData_singedate.csv", row.names = F) #contain the scored raw data from coinDesk with only one datapoint per date
+
+
+#______________________________IMPORTING DATA_____________________________#
+article_df <- read.csv("CoindeskData.csv", stringsAsFactors = F)
+article_df$date <- as.Date(article_df$date, stringsAsFactors = F)
+article_df_singledate <- read.csv("CoindeskData_singedate.csv", stringsAsFactors = F)
+article_df_singledate$date <- as.Date(article_df_singledate$date, stringsAsFactors = F)
+
+
+
+  #Fixing naming issue
+CD_article_df <- article_df
+CD_article_df_singledate <- article_df_singledate
+```
+
+#SCRAPING NYT
+```{r}
+#_____________________________________________________________________________________#
+#_____________________________________SCRAPING NYT____________________________________#
+#_____________________________________________________________________________________#
+
+
+#_________________________________CREATING SEARCH LINKS________________________________#
+  #constructing search links from search terms
+search_links <- paste("https://www.nytimes.com/search/", search_terms, "/newest", sep = "")
+
+
+#_____________________CREATING FUNCTION FOR EXTRACTING LINK FROM STRING____________________#  
+
+#this is also used for scraping CNBC
+
+#defining a function to extract the link from the website
+extract_href = function(string, append_to = NULL){
+  href_string <- gsub('.*href',"",string) #remove everything before href (including href) 
+  href_string <- gsub("><.*","",href_string) #remove everthing after '><'
+  href_string <- str_extract(href_string, '"(.*)"') #extract everything inside the ""
+  href_string <- gsub('"',"",href_string) #remove the '""
+  if (is.null(append_to) == F){ #is append_to is set to a string append href_string to that string
+    href_string <- paste(append_to, href_string, sep = "")
+  }
+  return(href_string)
+}
+
+#__________________________DEFINING A FUNCTION FOR 'LOAD MORE'___________________________#
+#defining a function to deal with the load more button
+load_more <- function(url, nround = 100){
+  driver <- rsDriver()
+  remDr <- driver[["client"]]
+  
+  #navigate to the url
+  remDr$navigate(url)
+    
+  # Locate the load more button
+  loadmorebutton <- try(remDr$findElement(using = 'xpath', '//*[@id="site-content"]/div/div/div[2]/div[3]/div/button'), silent = T)
+  if (class(loadmorebutton) == "try-error"){
+    loadmorebutton <- try(remDr$findElement(using = 'xpath', '//*[@id="site-content"]/div/div/div[2]/div[2]/div/button'))
+  }
+  
+  
+  #define time to wait between clicks (with some variation)
+  wait_times <- runif(nround, min = 5, max = 8)
+  
+  #click it!
+  ii <- 1
+  for (i in wait_times){
+    print(paste(ii, "/", nround, sep = ""))
+    Potential_error <- try(loadmorebutton$clickElement())
+    if (class(Potential_error) == "try-error"){
+      print("no more articles")
+      break #if there is no more articles stop trying to press the load more button 
+  }
+    Sys.sleep(i)
+    ii <-  ii+1
+  }
+  page_source<-remDr$getPageSource()
+  
+    #Close the session
+  remDr$close()
+  
+  return(page_source[[1]])
+}
+
+#_______________________________EXPANDING SEARCH LINKS________________________________#
+#expand the search page so that there is more articles
+for (search_link in search_links){ 
+  temp <- load_more(search_link, nround = 1000)
+  if (search_link == search_links[1]){
+    search_links_expanded <- temp
+  }
+  search_links_expanded <-  c(search_links_expanded, temp) 
+  }
+
+#_______________________________SCRAPE ARTICLES LINKS________________________________#
+ #loop through the expanded search links
+for (search_link in search_links_expanded){  
+  if (search_link == search_links_expanded[1]){
+    NYT_article_df <- data.frame(Article_links = NA, search_link = NA)
+  }
+  search_results <- search_link %>% #extracting search results
+    read_html() %>% 
+    html_nodes(".SearchResults-item--3k02W , .Item-topBorder--vaOX0")
+  
+  print(length(search_results))
+  
+  #extracting href from the search results 
+  for (string in as.character(search_results)){ 
+    href <- extract_href(string, append_to = "https://www.nytimes.com") 
+    if (string == as.character(search_results)[1]){
+      NYT_article_links <- c(href)
+    } else {
+    NYT_article_links <- c(NYT_article_links, href)
+    }
+  }
+  
+  #save the data
+  print("saving data")
+  
+  n_item <- match(search_link, search_links_expanded)
+  temp_df <- data.frame(Article_links = unique(NYT_article_links), 
+                        search_link = search_links[n_item])
+  if (search_link == search_links[1]){
+    NYT_article_df <- temp_df
+  } else{
+    NYT_article_df <- rbind(NYT_article_df, temp_df)
+  }
+  
+  #adding a wait timer
+  Sys.sleep(runif(1, min = 4, max = 5))
+}
+
+#removing dublicates and NA's
+NYT_article_df <- subset(NYT_article_df, !duplicated(NYT_article_df[,1]))
+NYT_article_df <- na.omit(NYT_article_df)
+
+#_______________________________SCRAPE ARTICLES CONTENT________________________________#
+NYT_article_df$bodytext = NA
+NYT_article_df$title = NA
+NYT_article_df$date = NA
+
+for (article_link in NYT_article_df$Article_links){
+    #print progress
+  i <- match(article_link, NYT_article_df$Article_links)
+  print(paste("Progress: ", i, " / ", length(NYT_article_df$Article_link), 
+              ". Number uniques: ", length(unique(NYT_article_df$title)), sep = ""))
+  
+  #if there is already data then go to the next one - this is for multiple run throughs in case of lost connection
+  if ((is.na(NYT_article_df$bodytext[i]) & is.na(NYT_article_df$title[i]) & is.na(NYT_article_df$date[i])) == F){next}
+  
+  #Extract variables including bodytext, title and date
+  bodytext <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes(".story-body") %>% 
+    html_text(), silent = T)
+  title <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes("#headline") %>% 
+    html_text(), silent = T)
+  date <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes(".dateline") %>% 
+    html_text(), silent = T)
+  
+    #if there page is not found go to the next one
+  if (class(bodytext) == "try-error" | class(title) == "try-error" | class(date) == "try-error"){next}
+  
+  n_redos <- 1
+  while ((identical(bodytext, character(0))| identical(title, character(0)) | identical(date, character(0))) & n_redos < 6){
+    print(paste("redoing the extract - ", n_redos, sep = ""))
+      bodytext <- article_link %>% 
+    read_html() %>% 
+    html_nodes(".story-body") %>% 
+    html_text()
+  title <- article_link %>% 
+    read_html() %>% 
+    html_nodes("#headline") %>% 
+    html_text()
+  date <- article_link %>% 
+    read_html() %>% 
+    html_nodes(".dateline") %>% 
+    html_text()
+  
+  Sys.sleep(runif(1, min = 4, max = 5))#wait timer
+  n_redos <- n_redos+1
+  }
+  if (n_redos == 6){
+    next
+  }
+  
+  #save variables
+  NYT_article_df$bodytext[i] <- bodytext
+  NYT_article_df$title[i] <- title
+  NYT_article_df$date[i] <- date
+  
+  #adding a wait timer
+  Sys.sleep(runif(1, min = 4, max = 5))
+}
+
+#________________________________SCORING AND MANIPULATING DATA_________________________________#
+
+NYT_article_df_raw <- NYT_article_df
+NYT_article_df <- na.omit(NYT_article_df) 
+
+NYT_article_df$date <-  gsub( "(\\d{1-2}, \\d{4}).*", "\\1", NYT_article_df$date) #removing everything other than the date
+NYT_article_df$date <- lubridate::mdy(NYT_article_df$date)
+
+NYT_article_df_singledate <- NYT_article_df %>% #make it so that there is only one row pr. article
+    group_by(date) %>% 
+    summarise(bodytexts = paste(bodytext, collapse = ', '), titles = paste(title, collapse = ', '))
+
+  #Scoring
+NYT_article_df$MSS <- sapply(NYT_article_df$bodytext, LabMT_score)
+NYT_article_df_singledate$MSS <- sapply(NYT_article_df_singledate$bodytexts, LabMT_score)
+
+
+#__________________________________PLOTS___________________________________#
+PLOT_NYT_MSS <- ggplot(NYT_article_df_singledate, aes(x = date, y = MSS)) +  geom_bar(stat = "identity") + labs(title = "MSS on NYT using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS)")
+
+PLOT_NYT_MSS.c <- ggplot(NYT_article_df_singledate, aes(x = date, y = MSS - mean(MSS))) +  geom_bar(stat = "identity") + labs(title = "MSS on NYT using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS) - centered")
+
+PLOT_NYT_MSS / PLOT_NYT_MSS.c
+
+#_______________________________EXPORT DATA________________________________#
+#write.csv(NYT_article_df_raw, "NYTData_raw.csv", row.names = F) #contain the raw data from NYT
+#write.csv(NYT_article_df, "NYTData.csv", row.names = F) 
+#write.csv(NYT_article_df_singledate, "NYTData_singledate.csv", row.names = F) 
+
+#_______________________________IMPORT DATA________________________________#
+NYT_article_df_raw <- read.csv("NYT_article_df_raw", stringsAsFactors = F)
+NYT_article_df <- read.csv("NYTData.csv", stringsAsFactors = F)
+NYT_article_df_singledate <- read.csv("NYTData_singledate.csv", stringsAsFactors = F)
+
+NYT_article_df$X <- NULL
+NYT_article_df$date <- as.Date(NYT_article_df$date)
+
+
+
+```
+
+#SCRAPING CNBC
+```{r} 
+#_____________________________________________________________________________________#
+#____________________________________SCRAPING CNBC____________________________________#
+#_____________________________________________________________________________________#
+
+
+#_______________________________GETTING THE SEARCH PAGES_______________________________#
+
+search_terms <- c("BITCOIN", "CRYPTOCURRENCY", "CRYPTOCURRENCIES")
+
+  #the number of search pages is checked manually and could naturally be automated
+search_links <- paste('https://search.cnbc.com/rs/search/view.html?partnerId=2000&keywords=BITCOIN&sort=date&type=news&source=CNBC.com,The%20Reformed%20Broker,Buzzfeed,Estimize,Curbed,Polygon,Racked,Eater,SB%20Nation,Vox,The%20Verge,Recode,Breakingviews,NBC%20News,The%20Today%20Show,Fiscal%20Times,The%20New%20York%20Times,Financial%20Times,USA%20Today&assettype=partnerstory,blogpost,wirestory,cnbcnewsstory&pubtime=0&pubfreq=a&page=', seq(128), sep = "") 
+search_links1 <- paste('https://search.cnbc.com/rs/search/view.html?partnerId=2000&keywords=', search_terms[2], '&sort=date&type=news&source=CNBC.com,The%20Reformed%20Broker,Buzzfeed,Estimize,Curbed,Polygon,Racked,Eater,SB%20Nation,Vox,The%20Verge,Recode,Breakingviews,NBC%20News,The%20Today%20Show,Fiscal%20Times,The%20New%20York%20Times,Financial%20Times,USA%20Today&assettype=partnerstory,blogpost,wirestory,cnbcnewsstory&pubtime=0&pubfreq=a&page=', seq(43), sep = "")
+search_links2 <- paste('https://search.cnbc.com/rs/search/view.html?partnerId=2000&keywords=', search_terms[3], '&sort=date&type=news&source=CNBC.com,The%20Reformed%20Broker,Buzzfeed,Estimize,Curbed,Polygon,Racked,Eater,SB%20Nation,Vox,The%20Verge,Recode,Breakingviews,NBC%20News,The%20Today%20Show,Fiscal%20Times,The%20New%20York%20Times,Financial%20Times,USA%20Today&assettype=partnerstory,blogpost,wirestory,cnbcnewsstory&pubtime=0&pubfreq=a&page=', seq(21), sep = "")
+search_links <- c(search_links, search_links1, search_links2)
+
+#____________________SCRAPING THE ARTICLE LINKS FROM THE SEARCH PAGES____________________#
+
+for (search_link in search_links){
+  
+  #extract the article links
+  temp <- search_link %>% read_html() %>% html_nodes(".title") 
+  temp <- extract_href(as.character(temp))
+  
+  #save variables:
+  if (search_link == search_links[1]){
+    Article_links_CNBC <- temp
+  } else{
+    Article_links_CNBC <- c(Article_links_CNBC, temp)
+  }
+}
+
+Article_links_CNBC <-  unique(Article_links_CNBC)
+
+
+#___________________________SCRAPING THE ARTICLE LINKS___________________________#
+
+
+for (article_link in Article_links_CNBC){
+  i <- match(article_link, Article_links_CNBC)
+  print(paste(i, "/", length(Article_links_CNBC)))
+  
+  bodytext <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes(".group") %>% 
+    html_text())
+  title <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes(".title") %>% 
+    html_text())
+  date <- try(article_link %>% 
+    read_html() %>% 
+    html_nodes(".datestamp") %>% 
+    html_text())
+  
+   #if there page is not found go to the next one
+  if (class(bodytext) == "try-error" | class(title) == "try-error" | class(date) == "try-error"){
+    bodytext <- NA
+    title <- NA
+    date <- NA
+  } else {
+    #fix variables
+    bodytext <- paste(bodytext, collapse = ', ') #collapse bodytext in case there is multiple groups of text
+    title <- title[1]
+    date <- date[1]
+  }
+  
+  #fix variables
+  bodytext <- paste(bodytext, collapse = ', ') #collapse bodytext in case there is multiple groups of text
+  title <- title[1]
+  date <- date[1]
+  
+  #save the data
+  temp_df <- data.frame(bodytext = bodytext, title = title, date = date, article_link = article_link)
+  if (article_link == Article_links_CNBC[1]){
+    CNBC_article_df <- temp_df
+  } else {
+    CNBC_article_df <- rbind(CNBC_article_df, temp_df)
+  }
+}
+
+#_______________________________CLEANING THE DATA_______________________________#
+
+
+CNBC_article_df$date 
+  
+date <- gsub( ".*(\\d{4}/\\d{2}/\\d{2}).*", "\\1", CNBC_article_df$article_link)
+date <- gsub( "/", "-", date)
+
+  #checking date variable to exceptions
+date
+date[1000:length(date)]
+
+
+  #fixing the exceptions
+lower_exc <- 1243 #defining exception range
+higher_exc <- 1276 
+
+date[lower_exc:higher_exc] <- as.character(CNBC_article_df$date)[lower_exc:higher_exc]
+date[lower_exc:higher_exc] <- gsub( ".*,", "", date[lower_exc:higher_exc]) #removing everything before the ','
+date[lower_exc:higher_exc] <- gsub("[\t\n]", "", date[lower_exc:higher_exc] ) #removing line breaks and tabs
+date[lower_exc:higher_exc] <- as.character(lubridate::dmy(date[lower_exc:higher_exc]))
+
+CNBC_article_df$date <- as.Date(date)
+
+#_______________________SCORING AND DATAFRAME MANIPULATION_______________________#
+CNBC_article_df_raw <- CNBC_article_df
+CNBC_article_df <- na.omit(CNBC_article_df) #removing NA's
+
+  #aggregating to there is only one datapoint pr. day
+CNBC_article_df_singledate <- CNBC_article_df %>% #make it so that there is only one row pr. article
+    group_by(date) %>% 
+    summarise(bodytexts = paste(bodytext, collapse = ', '), titles = paste(title, collapse = ', '))
+
+  #scoring it
+CNBC_article_df$MSS <- sapply(CNBC_article_df$bodytext, LabMT_score)
+CNBC_article_df_singledate$MSS <- sapply(CNBC_article_df_singledate$bodytexts, LabMT_score)
+
+CNBC_article_df_singledate <- na.omit(CNBC_article_df_singledate)
+
+#___________________________________PLOTS___________________________________#
+  
+#make a plot
+plot_MSS_CNBC <- ggplot(CNBC_article_df_singledate, aes(x = date, y = MSS)) +  geom_bar(stat = "identity") + labs(title = "MSS on CNBC using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS)")
+
+plot_MSS_CNBC.c <- ggplot(CNBC_article_df_singledate, aes(x = date, y = MSS - mean(MSS))) +  geom_bar(stat = "identity") + labs(title = "MSS on CNBC using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS) - centered")
+
+#_____________________________EXPORTING THE DATA_____________________________#
+
+#write.csv(CNBC_article_df_raw, "CNBCData_raw.csv", row.names = F) #raw data
+#write.csv(CNBC_article_df, "CNBCData.csv", row.names = F) #contain article data the from CNBC (with cleaning and scoring)
+#write.csv(CNBC_article_df_singledate, "CNBCData_singledata.csv", row.names = F) #aggregated so there is only one datapoint pr. day
+
+#_____________________________IMPORTING THE DATA_____________________________#
+CNBC_article_df_raw <- read.csv("CNBCData_raw.csv", stringsAsFactors = F)
+CNBC_article_df <- read.csv("CNBCData.csv", stringsAsFactors = F)
+CNBC_article_df$date <- as.Date(CNBC_article_df$date)
+CNBC_article_df_singledate <- read.csv("CNBCData_singledata.csv", stringsAsFactors = F)
+``` 
+
+#OTHER
+```{r}
+#____________________________________MERGING DATA____________________________________#
+
+sentiment_df_singledate <- Reduce(function(x, y) merge(x, y, by = "date", all=T), list(
+  select(NYT_article_df_singledate, date, NYT_MSS = MSS), 
+  select(CD_article_df_singledate, date, CD_MSS = MSS), 
+  select(CNBC_article_df_singledate, date, CNBC_MSS = MSS)
+))
+
+NYT_article_df$date <- as.Date(NYT_article_df$date)
+CD_article_df$date <- as.Date(CD_article_df$date)
+CNBC_article_df$date <- as.Date(CNBC_article_df$date)
+sentiment_df <- Reduce(function(x, y) merge(x, y, by = "date", all=T), list(
+  select(NYT_article_df, date, NYT_MSS = MSS, NYT_bodytext = bodytext), 
+  select(CD_article_df, date, CD_MSS = MSS, CD_bodytext = bodytext), 
+  select(CNBC_article_df, date, CNBC_MSS = MSS, CNBC_bodytext = bodytext)
+))
+
+#make it so that no data appears twice due to merging 
+sentiment_df$NYT_MSS[duplicated(sentiment_df$NYT_bodytext)] <- NA
+sentiment_df$CD_MSS[duplicated(sentiment_df$CD_bodytext)] <- NA
+sentiment_df$CNBC_MSS[duplicated(sentiment_df$CNBC_bodytext)] <- NA
+
+  #article length
+sentiment_df$NYT_length <- sapply(sentiment_df$NYT_bodytext, function(x) nchar(x))
+sentiment_df$CD_bodytext <- sapply(sentiment_df$CD_bodytext, function(x)  iconv(enc2utf8(x),sub="byte")) #due to problems with encoidng
+sentiment_df$CD_length <- sapply(sentiment_df$CD_bodytext, function(x) nchar(x))
+sentiment_df$CNBC_length <- sapply(sentiment_df$CNBC_bodytext, function(x) nchar(x))
+
+  #n articles
+sentiment_df$n_NYT_articles <- NA
+sentiment_df$n_CNBC_articles <- NA
+sentiment_df$n_CD_articles <- NA
+for (day in unique(as.character(sentiment_df$date))){
+  i <- match(day, (unique(as.character(sentiment_df$date))))
+  print(paste(day," ", i, "/", length(unique(as.character(sentiment_df$date))), sep = ""))
+  temp_df <- subset(sentiment_df, date == day)
+  sentiment_df$n_NYT_articles[sentiment_df$date == day] <-
+    length((temp_df$NYT_MSS[complete.cases(temp_df$NYT_MSS)]))
+  sentiment_df$n_CNBC_articles[sentiment_df$date == day] <- 
+    length((temp_df$CD_MSS[complete.cases(temp_df$CD_MSS)]))
+  sentiment_df$n_CD_articles[sentiment_df$date == day] <-
+    length((temp_df$CNBC_MSS[complete.cases(temp_df$CNBC_MSS)]))
+}
+
+sentiment_df_with_text <- sentiment_df #save it with the text
+
+sentiment_df <- select(sentiment_df, date, NYT_MSS, CD_MSS, CNBC_MSS, NYT_length, CD_length, CNBC_length, n_NYT_articles, n_CD_articles, n_CNBC_articles)
+
+  #remove cases where there is na's in all three rows
+sentiment_df <-sentiment_df[!(is.na(sentiment_df$NYT_MSS) &
+                           is.na(sentiment_df$CD_MSS) &
+                           is.na(sentiment_df$CNBC_MSS)),]
+
+
+#____________________________________LONG FORMAT____________________________________#
+  #single date
+sentiment_df_long <- melt(sentiment_df_singledate,
+        # ID variables - all the variables to keep but not split apart on
+    id.vars=c("date"),
+        # The source columns
+    measure.vars=colnames(sentiment_df_singledate)[colnames(sentiment_df_singledate) != "date"],
+        # Name of the destination column that will identify the original
+    variable.name="News",
+            # column that the measurement came from
+    value.name="MSS"
+)
+sentiment_df_long <- na.omit(sentiment_df_long)
+
+  #with text
+sentiment_df_with_text_long <- melt(
+  select(sentiment_df_with_text, date, NYT = NYT_MSS, CD = CD_MSS, CNBC = CNBC_MSS),
+  id.vars=c("date"),
+  measure.vars= c("NYT", "CD", "CNBC"),
+  variable.name=c("News"),
+  value.name="MSS"
+  )
+  #adding the bodytext
+sentiment_df_with_text_long$bodytext <- melt(sentiment_df_with_text, 
+                                    id.vars=c("date"), 
+                                    measure.vars= c("NYT_bodytext", "CD_bodytext", "CNBC_bodytext"),
+                                    variable.name=c("News"), value.name="bodytext"
+                                    )$bodytext
+
+sentiment_df_with_text_long <- na.omit(sentiment_df_with_text_long)
+
+
+#_________________________________MINOR CALCUATIONS_________________________________#
+  #calculating article length
+sentiment_df_with_text_long$bodytext <- sapply(sentiment_df_with_text_long$bodytext, function(x) iconv(enc2utf8(x),sub="byte"))
+sentiment_df_with_text_long$length <- sapply(sentiment_df_with_text_long$bodytext, function(x) nchar(x))
+sentiment_df_with_text_long$length <- scale(sentiment_df_with_text_long$length)[,1]
+sentiment_df_with_text_long$small_text <- as.factor(ifelse(sentiment_df_with_text_long$length <= -1, 1, 0)) #is the small?
+
+
+#____________________________________PLOTS____________________________________#
+ggplot(sentiment_df_long, aes(x = date, y = MSS-mean(MSS), fill = News)) +  geom_bar(stat = "identity") + labs(title = "MSS using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS) - centered")
+
+ggplot(sentiment_df_long, aes(x = date, y = MSS)) +  geom_bar(stat = "identity") + labs(title = "MSS using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS)") + facet_grid(~News)
+       
+ggplot(sentiment_df_long, aes(x = date, y = MSS - mean(MSS))) +  geom_bar(stat = "identity") + labs(title = "MSS using the search terms 'cryptocurrencies', 'cryptocurrency' and 'bitcoin'", x = "Date", y = "Mean Sentiment Score (MSS) - centered") + facet_grid(~News)
+
+ggplot(sentiment_df_with_text_long, aes(x = date, y = MSS - mean(MSS), color = small_text)) +  geom_point() + labs(title = "Temp title", x = "Date", y = "Mean Sentiment Score (MSS) - centered")
+
+
+#_______________________CALCULATING DAILY VARIANCE & SCALING_______________________#
+
+sentiment_df$NYT_MSS <- scale(sentiment_df$NYT_MSS)[,1]
+sentiment_df$CD_MSS <- scale(sentiment_df$CD_MSS)[,1]
+sentiment_df$CNBC_MSS <- scale(sentiment_df$CNBC_MSS)[,1]
+
+sentiment_df <- sentiment_df %>% 
+  group_by(date) %>% 
+  summarise(NYT_dailySD = sd(NYT_MSS), CD_dailySD = sd(CD_MSS), CNBC_dailySD = sd(CNBC_MSS)) %>%  
+  merge(sentiment_df)
+
+#____________________________________EXPORT____________________________________#
+write.csv(sentiment_df, "sentiment_data.csv", row.names = F)
+
+  #Correlation check
+sentiment_df_temp <- na.omit(select(sentiment_df, NYT_MSS, CD_MSS, CNBC_MSS))
+cor(data.frame(NYT = sentiment_df_temp$NYT_MSS, CD = sentiment_df_temp$CD_MSS, CNBC = sentiment_df_temp$CNBC_MSS))
+
+cor.test(sentiment_df_temp$NYT_MSS, sentiment_df_temp$CD_MSS)
+cor.test(sentiment_df_temp$NYT_MSS, sentiment_df_temp$CNBC_MSS)
+cor.test(sentiment_df_temp$CD_MSS, sentiment_df_temp$CNBC_MSS)
+```
+
+```{r}
+#Tell you when it is done 
+beepr::beep(4)
+```
+#Stuff which might be relevant
+
+beginner's guide
+  https://www.analyticsvidhya.com/blog/2017/03/beginners-guide-on-web-scraping-in-r-using-rvest-with-hands-on-knowledge/
+  
+  dealing with 'load more' boxes
+  https://stackoverflow.com/questions/37549217/scraping-data-using-rvest-when-load-more-option-is-present-at-the-end-of-the
+  
+  dealing with dynamic pages
+  https://stackoverflow.com/questions/29861117/r-rvest-scraping-a-dynamic-ecommerce-page
+  
+  more extensive?
+  http://brazenly.blogspot.dk/2016/05/r-advanced-web-scraping-dynamic.html
+
+

@@ -1,0 +1,1125 @@
+---
+title: "Analysis"
+author: "Kenneth Enevoldsen & Dana Jensen"
+date: "5/2/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#_____________________________________________________________________________________#
+#_______________________________SET WD AND LOAD PACKAGES______________________________#
+#_____________________________________________________________________________________#
+setwd("/Users/kennethenevoldsen/Desktop/Github/Statistic R/Beers and Bitcoin/BeersAndBitcoin")
+library(pacman) 
+p_load(stringr, dplyr, tidytext, ggplot2, beepr, lubridate, reshape2, patchwork, brms, rethinking, mice)
+```
+
+#LOAD DATA
+```{r}
+#_____________________________________________________________________________________#
+#______________________________________LOAD DATA______________________________________#
+#_____________________________________________________________________________________#
+
+price_df <- read.csv("price_CSAD_df.csv", stringsAsFactors = F)
+sentiment_df <- read.csv("sentiment_data.csv", stringsAsFactors = F)
+sentiment_df$date <- as.Date(sentiment_df$date)
+price_df$date <- as.Date(price_df$date)
+```
+
+#Sentiment Herding
+```{r}
+
+#________________________MAKING SENTIMENT DATA INTO LONG FORMAT_______________________#
+sentiment_df_long <- melt(select(sentiment_df, NYT_MSS, CD_MSS, CNBC_MSS, date),
+        # ID variables - all the variables to keep but not split apart on
+    id.vars=c("date"),
+        # The source columns
+    measure.vars=colnames(select(sentiment_df, NYT_MSS, CD_MSS, CNBC_MSS, date))[colnames(select(sentiment_df, NYT_MSS, CD_MSS, CNBC_MSS, date)) != "date"],
+        # Name of the destination column that will identify the original
+    variable.name="news",
+            # column that the measurement came from
+    value.name="MSS"
+)
+
+#________________________CALCULATING CSSD FOR SENTIMENT_______________________#
+for (i in as.character(unique(sentiment_df_long$date))){
+  ## to test/make sure it works
+  print(i)
+  ## making date into character so it matches with i
+  temp <- sentiment_df_long
+  temp <- na.omit(subset(temp, date == i))
+  ## calculate CSD
+  n <- length(temp$news)
+  if (length(unique(temp$news)) != 1) { #Calculate CSSD only if there is more that one news
+    if (length(unique(temp$news)) ==length(temp$news)){ #if there is only one news article pr. newspaper calculate as usual
+    CSAD_t <- sum(abs(temp$MSS - mean(temp$MSS)))/(n-1)
+    } else { #if there is multiple articles pr. paper
+      m <- lme4::lmer(MSS ~ 1 + (1|news), temp) #calculating a model using a random effect to account for multiple articles pr. paper
+      CSAD_t <- sum(abs(summary(m)$residuals))/(n-1) #using the residual from the model to account for multiple articles pr paper. Using the model is otherwise equavalent.
+    }
+  } else {
+  CSAD_t <- NA
+  }
+  ## save in new df, cause I don't have enough dataframes
+  temp_df <- data.frame( CSAD = CSAD_t, date = i)
+  if (i == unique(sentiment_df_long$date)[1]){
+    sent_CSAD <- temp_df
+  }else{
+    sent_CSAD <- rbind(sent_CSAD, temp_df)
+  }}
+
+#_____________________________________PLOT___________________________________#
+sent_CSAD$date <- as.Date(sent_CSAD$date)
+CSADplot <- ggplot(sent_CSAD, aes(date, CSAD)) + geom_point() +
+  geom_smooth(method = "lm") + labs(title = "CSSD for sentiment in news media, grey area is 95% CI")
+ggplot(sent_CSAD, aes(CSAD)) + geom_density() + 
+  geom_vline(aes(xintercept = mean(sent_CSAD$CSAD, na.rm = T), color = "mean")) +
+  geom_vline(aes(xintercept = median(sent_CSAD$CSAD, na.rm = T), color = "median")) + 
+  scale_color_manual(name = "statistics", values = c(median = "blue", mean = "red"))
+  
+
+#___________________________MERGING AND DATA FIXING__________________________#
+sent_CSAD$CSAD[is.nan(sent_CSAD$CSAD)] <-  NA
+sent_CSAD$CSAD[sent_CSAD$CSAD == Inf] <-  NA
+sent_CSAD$date <- as.Date(sent_CSAD$date)
+
+sentiment_df <- merge(sentiment_df, select(sent_CSAD, media_CSAD = CSAD, date), by = "date")
+```
+
+
+#Trends
+```{r}
+#_____________________________________________________________________________________#
+#____________________________________TREND ANALYSIS___________________________________#
+#_____________________________________________________________________________________#
+
+  
+#____________________________________SENTIMENT TRENDS_________________________________#
+
+  #defining functions to analyse trends
+
+get_trend <- function(datecolumn, trendcolumn){
+  #analyses positive or negative trends
+  temp_df <- data.frame(score = trendcolumn, date = datecolumn)
+  trend <- c()
+  sum_trend <- c()
+  #loop through all the dates
+  for (d in seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day")){
+    i <- match(d, seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day"))
+    print(i)
+    
+    daily_df <- try(subset(temp_df, date == d))
+    
+    if (class(daily_df)[1] == "try-error" | is.na(mean(daily_df$score, na.rm = T))){
+      x = 0; trend <- c(trend, x)
+      sum_trend = c(sum_trend, 0)
+      next
+    }
+    if (mean(daily_df$score, na.rm = T) > 0){ #if the score is negative
+      x = 1; trend <- c(trend, x)
+    } else if (mean(daily_df$score, na.rm = T) < 0){#if the score is positive
+      x = -1; trend <- c(trend, -1)
+    } else {
+      x = 0; trend <- c(trend, x)
+    }
+    if (length(trend) >= 3){
+      #if the two previous values where identical (e.g. they were both negative) create a trend
+      if (trend[i-1] == x & trend[i-2] == x & x != 0){ 
+        sum_trend = c(sum_trend, x+sum_trend[i-1])
+      } else if (length(trend) >= 4){
+         if (trend[i-2] == x & trend[i-3] == x & x != 0){ #there have to be 2 or more consecutive event to constitute a change in trend
+        sum_trend = c(sum_trend, x+sum_trend[i-1])
+         } else {
+        sum_trend = c(sum_trend, 0)
+      }} else {
+        sum_trend = c(sum_trend, 0)
+      }
+    } else{
+      sum_trend = c(sum_trend, 0)
+    }
+  }
+return(data.frame(trend = sum_trend, date = seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day")))
+}
+
+get_herding_trend <- function(datecolumn, trendcolumn, threshold=mean(trendcolumn, na.rm = T)){ 
+  #analyse trends in measure of herding - a defined interval is needed
+  temp_df <- data.frame(score = trendcolumn, date = datecolumn)
+  trend <- c()
+  sum_trend <- c()
+  #loop through all the dates
+  for (d in seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day")){
+    i <- match(d, seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day"))
+    print(i)
+    
+    daily_df <- try(subset(temp_df, date == d))
+    
+    if (class(daily_df)[1] == "try-error" | is.na(mean(daily_df$score, na.rm = T))){
+      x = 0; trend <- c(trend, x)
+      sum_trend = c(sum_trend, 0)
+      next
+    }
+    if (mean(daily_df$score, na.rm = T) <= threshold){ #if there is herding
+      x = 1; trend <- c(trend, x)
+    } else {
+      x = 0; trend <- c(trend, x)
+    }
+    if (length(trend) >= 3){
+      #if the two previous values where identical (e.g. they were both negative) create a trend
+      if (trend[i-1] == x & trend[i-2] == x & x != 0){ 
+        sum_trend = c(sum_trend, x+sum_trend[i-1])
+      } else if (length(trend) >= 4){
+         if (trend[i-2] == x & trend[i-3] == x & x != 0){ #there have to be 2 or more consecutive event to constitute a change in trend
+        sum_trend = c(sum_trend, x+sum_trend[i-1])
+         } else {
+        sum_trend = c(sum_trend, 0)
+      }} else {
+        sum_trend = c(sum_trend, 0)
+      }
+    } else{
+      sum_trend = c(sum_trend, 0)
+    }
+  }
+return(data.frame(trend = sum_trend, date = seq.Date(from = min(temp_df$date), to = max(temp_df$date), by = "day")))
+}
+
+trend_df <- Reduce(function(x, y) merge(x, y, by = "date", all=T), list(
+  select(get_trend(sentiment_df$date, sentiment_df$NYT_MSS), date, NYT_trend = trend), 
+  select(get_trend(sentiment_df$date, sentiment_df$CD_MSS), date, CD_trend = trend), 
+  select(get_trend(sentiment_df$date, sentiment_df$CNBC_MSS), date, CNBC_trend = trend),
+  select(get_herding_trend(sentiment_df$date, sentiment_df$media_CSAD), date, media_trend = trend)
+))
+
+
+#____________________________________PLOTS_________________________________#
+
+trend_df_long <- melt(trend_df,
+        # ID variables - all the variables to keep but not split apart on
+    id.vars=c("date"),
+        # The source columns
+    measure.vars=colnames(trend_df)[colnames(trend_df) != "date"],
+        # Name of the destination column that will identify the original
+    variable.name="news",
+            # column that the measurement came from
+    value.name="trend"
+)
+ggplot(subset(trend_df_long, news != 'media_trend'), aes(date, trend, fill = news)) + geom_bar(stat = "identity", position="dodge") + theme_minimal()
+trendplot <- ggplot(subset(trend_df_long, news == 'media_trend'), aes(date, trend, fill = news)) + geom_bar(stat = "identity", position="dodge") + theme_minimal()
+
+trendplot / CSDplot
+
+
+#____________________________________MERGING WITH SENTIMENT_________________________________#
+sentiment_df <- left_join(sentiment_df, trend_df, by = "date")
+
+```
+
+#Merge
+```{r}
+#_____________________________________MERGE DATA______________________________________#
+complete_df <- merge(price_df, sentiment_df, by = "date", all=T) 
+complete_df$date <- as.Date(complete_df$date) 
+complete_df <- complete_df[complete.cases(complete_df$btc_close),] #exclude cases where there is no value for bitcoin
+complete_df <- complete_df[complete.cases(complete_df$SP500_close),] #remove cases where there is no values of S&P, this includes weekends which might be problematic
+```
+
+#Minor Calculations
+```{r}
+#___________________CALCULATE THE DAILY VARIATION OF BITCOIN_______________________#
+complete_df$daily_var <- abs(complete_df$btc_high - complete_df$btc_low)
+
+#__________________________________DAILY CHANGE_____________________________________#
+complete_df$daily_change <- complete_df$btc_close - complete_df$btc_open
+
+#_______________________________YESTERDAYS CHANGE__________________________________#
+complete_df$yesterday_change <- c(NA, complete_df$daily_change[1:(length(complete_df$daily_change)-1)])
+
+
+#______________________________MOVING 1 DAY BACK____________________________________#
+
+day_back <- function(x){
+  x  <-  c(NA, x[1:(length(x)-1)])
+  return(x)  
+}
+
+Minus1day = c("crypto_CSAD", "btc_vs_mrkt_CSAD", "SP500_close", "NYT_dailySD", "CD_dailySD", "CNBC_dailySD", "NYT_MSS", "CD_MSS", "CNBC_MSS", "NYT_length", "CD_length", "CNBC_length", "n_NYT_articles", "n_CD_articles", "n_CNBC_articles", "media_CSAD", "NYT_trend", "CD_trend", "CNBC_trend", "media_trend")
+
+
+complete_df <- complete_df[, colnames(complete_df) %in% Minus1day] %>% #select rows to rescale 
+  lapply(. , function(x) day_back(x)) %>%  #adding mean and sd manually to add the na.rm = T to removes NA's
+  cbind(. , complete_df[,! colnames(complete_df) %in% Minus1day]) #bind with remaining rows
+
+complete_df <- complete_df[2:nrow(complete_df),]
+
+```
+
+#Trend (again)
+```{r} 
+  #trends in yesterdays change
+complete_df <- left_join(complete_df, 
+          select(get_trend(complete_df$date, complete_df$yesterday_change), date, yesterday_trend = trend), 
+          by = "date")
+
+  #trends in btc v market CSAD
+complete_df <- left_join(complete_df, 
+          select(get_herding_trend(complete_df$date, complete_df$btc_vs_mrkt_CSAD), date, btc_vs_mrkt_trend = trend), 
+          by = "date")
+
+  #trends in crypto CSAD
+complete_df <- left_join(complete_df, 
+          select(get_herding_trend(complete_df$date, complete_df$crypto_CSAD), date, crypto_trend = trend), 
+          by = "date")
+
+complete_df$date <- as.Date(complete_df$date)
+```
+
+
+#Missing values and data fixing
+```{r}
+  #transforming date to factor
+complete_df$char_date <- as.factor(as.character(complete_df$date))
+
+
+  #aggregating dataframe (one date pr. row)
+complete_df.a <- select(complete_df, daily_change, btc_vs_mrkt_CSAD, btc_vs_mrkt_trend, crypto_CSAD, crypto_trend, NYT_MSS, NYT_trend, CD_MSS, CD_dailySD, CD_trend, CNBC_MSS,  CNBC_trend, CNBC_MSS, CNBC_trend, yesterday_change, yesterday_trend, SP500_close, daily_var, date, media_trend, media_CSAD)  %>% 
+    group_by(date) %>% 
+    summarise_all(function(x) mean(x, na.rm=T))
+
+
+
+  #replacing NaN's
+is.nan.data.frame <- function(x)
+do.call(cbind, lapply(x, is.nan))
+
+complete_df.a[is.nan(complete_df.a)] <- NA
+
+  #saving before we start - just in case:
+
+write.csv(complete_df.a, "complete_df.a.csv", row.names = F)
+write.csv(complete_df, "complete_df.csv", row.names = F)
+
+
+#_______________________________COMPUTING MISSSING VALUES_______________________________#
+
+  #replacing trends NA's with 0 as these shouldn't be computes
+complete_df$NYT_trend[is.na(complete_df$NYT_trend)] <- 0
+complete_df$media_trend[is.na(complete_df$media_trend)] <- 0
+complete_df$CD_trend[is.na(complete_df$CD_trend)] <- 0
+complete_df$CNBC_trend[is.na(complete_df$CNBC_trend)] <- 0
+
+
+complete_df.a$NYT_trend[is.na(complete_df.a$NYT_trend)] <- 0
+complete_df.a$media_trend[is.na(complete_df.a$media_trend)] <- 0
+complete_df.a$CD_trend[is.na(complete_df.a$CD_trend)] <- 0
+complete_df.a$CNBC_trend[is.na(complete_df.a$CNBC_trend)] <- 0
+
+  #names and names with missing values
+allVars <- names(complete_df)
+missVars <- names(complete_df)[colSums(is.na(complete_df)) > 0]
+
+allVars.a <- names(complete_df.a)
+missVars.a <- names(complete_df.a)[colSums(is.na(complete_df.a)) > 0]
+
+  #creating predictor matrix
+predictorMatrix <- matrix(0, ncol = length(allVars), nrow = length(allVars))
+rownames(predictorMatrix) <- allVars
+colnames(predictorMatrix) <- allVars
+
+predictorMatrix.a <- matrix(0, ncol = length(allVars.a), nrow = length(allVars.a))
+rownames(predictorMatrix.a) <- allVars.a
+colnames(predictorMatrix.a) <- allVars.a
+
+  #specifying variables for informed imputation
+imputerVars <- c("NYT_MSS","NYT_trend","CD_MSS","CD_dailySD","CD_trend","CNBC_MSS","CNBC_trend","yesterday_change","yesterday_trend", "media_trend", "btc_vs_mrkt_CSAD")
+
+imputerMatrix <- predictorMatrix
+imputerMatrix[,imputerVars] <- 1
+
+imputerMatrix.a <- predictorMatrix.a
+imputerMatrix.a[,imputerVars] <- 1
+
+  #specifying values to be imputed
+imputedMatrix <- predictorMatrix
+imputedMatrix[missVars[missVars %in% missVars.a],] <- 1
+
+imputedMatrix.a <- predictorMatrix.a
+imputedMatrix.a[missVars.a,] <- 1
+
+  #constructing final predictor matrix
+predictorMatrix <- imputerMatrix * imputedMatrix
+predictorMatrix.a <- imputerMatrix.a * imputedMatrix.a
+
+
+  #computing mice
+mice_complete_df <- mice(data = complete_df, predictorMatrix = predictorMatrix)
+mice_complete_df.a <- mice(data = complete_df.a, predictorMatrix = predictorMatrix.a, print = F)
+
+```
+
+#Defining models (with MI)
+```{r}
+#____________________________________DEFINE MODELS____________________________________#
+
+###Non-aggregated models
+  #simple model
+m1_formula <- bf(daily_change ~ 1 + (1|char_date))
+
+  #only sentiment
+m2_formula <- bf(daily_change ~ mi(NYT_MSS) + mi(CD_MSS) + mi(CNBC_MSS) + (1|char_date)) + 
+  bf(NYT_MSS | mi() ~ 1 + CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ 1+ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ 1 + NYT_MSS + CNBC_MSS) + set_rescor(F)
+
+  #only herding
+m3_formula <- brms::bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + (1|char_date)) 
+
+    #previous day (and general market)
+m4_formula <- bf(daily_change ~ yesterday_change + SP500_close + (1|char_date))
+
+  #market herding and sentiment
+m5_formula <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   mi(NYT_MSS) + mi(CD_MSS) + mi(CNBC_MSS) + (1|char_date)) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + set_rescor(F)
+
+  #herding, sentiment, previous day and variance
+m6_formula <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   mi(NYT_MSS) + mi(CD_MSS)*mi(CD_dailySD) + mi(CNBC_MSS) + 
+                   yesterday_change + SP500_close +
+                   (1|char_date),
+                   sigma ~ daily_var + (1|char_date)) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + 
+  bf(CD_dailySD | mi() ~ 1) +
+  set_rescor(F)
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD*btc_vs_mrkt_trend + 
+                   crypto_CSAD*crypto_trend +
+                   mi(NYT_MSS)*NYT_trend + 
+                   mi(CD_MSS)*mi(CD_dailySD)*CD_trend +
+                   mi(CNBC_MSS)*CNBC_trend +
+                   media_CSAD*media_trend +
+                   yesterday_change*yesterday_trend + 
+                   SP500_close + (1|char_date),
+                   sigma ~ daily_var + (1|char_date)) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + 
+  bf(CD_dailySD | mi() ~ 1) +
+  set_rescor(F)
+
+###Aggregated models
+  #simple model
+m1_formula.a <- bf(daily_change ~ 1)
+
+  #only sentiment
+m2_formula.a <- bf(daily_change ~ mi(NYT_MSS) + mi(CD_MSS) + mi(CNBC_MSS)) + 
+  bf(NYT_MSS | mi() ~ 1 + CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ 1+ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ 1 + NYT_MSS + CNBC_MSS) + set_rescor(F)
+
+  #only herding
+m3_formula.a <- brms::bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD) 
+
+    #previous day (and general market)
+m4_formula.a <- bf(daily_change ~ yesterday_change + SP500_close)
+
+  #market herding and sentiment
+m5_formula.a <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   mi(NYT_MSS) + mi(CD_MSS) + mi(CNBC_MSS)) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + set_rescor(F)
+
+  #herding, sentiment, previous day and variance
+m6_formula.a <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   mi(NYT_MSS) + mi(CD_MSS)*mi(CD_dailySD) + mi(CNBC_MSS) + 
+                   yesterday_change + SP500_close,
+                   sigma ~ daily_var) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + 
+  bf(CD_dailySD | mi() ~ 1) +
+  set_rescor(F)
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula.a <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD*btc_vs_mrkt_trend + 
+                   crypto_CSAD*crypto_trend +
+                   mi(NYT_MSS)*NYT_trend + 
+                   mi(CD_MSS)*mi(CD_dailySD)*CD_trend +
+                   mi(CNBC_MSS)*CNBC_trend +
+                   media_CSAD*media_trend +
+                   yesterday_change*yesterday_trend + 
+                   SP500_close,
+                   sigma ~ daily_var) +
+  bf(NYT_MSS | mi() ~ CD_MSS + CNBC_MSS) +
+  bf(CNBC_MSS | mi() ~ CD_MSS + NYT_MSS) +
+  bf(CD_MSS | mi() ~ NYT_MSS + CNBC_MSS) + 
+  bf(CD_dailySD | mi() ~ 1) +
+  set_rescor(F)
+
+
+
+```
+
+#Defining models (without MI's)
+```{r} 
+#____________________________________DEFINE MODELS____________________________________#
+
+###Non-aggregated models
+  #simple model
+m1_formula.m <- bf(daily_change ~ 1 + (1|char_date))
+
+  #only sentiment
+m2_formula.m <- bf(daily_change ~ NYT_MSS + CD_MSS + CNBC_MSS + (1|char_date))
+
+  #only herding
+m3_formula.m <- brms::bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + (1|char_date)) 
+
+    #previous day (and general market)
+m4_formula.m <- bf(daily_change ~ yesterday_change + SP500_close + (1|char_date))
+
+  #market herding and sentiment
+m5_formula.m <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   NYT_MSS + CD_MSS + CNBC_MSS + (1|char_date)) 
+
+  #herding, sentiment, previous day and variance
+m6_formula.m <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   NYT_MSS + CD_MSS*CD_dailySD + CNBC_MSS + 
+                   yesterday_change + SP500_close +
+                   (1|char_date),
+                   sigma ~ daily_var + (1|char_date)) 
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula.m <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD*btc_vs_mrkt_trend + 
+                   crypto_CSAD*crypto_trend +
+                   NYT_MSS*NYT_trend + 
+                   CD_MSS*CD_dailySD*CD_trend +
+                   CNBC_MSS*CNBC_trend +
+                   media_CSAD*media_trend +
+                   yesterday_change*yesterday_trend + 
+                   SP500_close + (1|char_date),
+                   sigma ~ daily_var + (1|char_date)) 
+
+###Aggregated models
+  #simple model
+m1_formula.a.m <- bf(daily_change ~ 1)
+
+  #only sentiment
+m2_formula.a.m <- bf(daily_change ~ NYT_MSS + CD_MSS + CNBC_MSS)
+
+  #only herding
+m3_formula.a.m <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD) 
+
+    #previous day (and general market)
+m4_formula.a.m <- bf(daily_change ~ yesterday_change + SP500_close)
+
+  #market herding and sentiment
+m5_formula.a.m <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   NYT_MSS + CD_MSS + CNBC_MSS) 
+
+  #herding, sentiment, previous day and variance
+m6_formula.a.m <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   NYT_MSS + CD_MSS*CD_dailySD + CNBC_MSS + 
+                   yesterday_change + SP500_close,
+                   sigma ~ daily_var) 
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula.a.m <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD*btc_vs_mrkt_trend + 
+                   crypto_CSAD*crypto_trend +
+                   NYT_MSS*NYT_trend + 
+                   CD_MSS*CD_dailySD*CD_trend +
+                   CNBC_MSS*CNBC_trend +
+                   media_CSAD*media_trend +
+                   yesterday_change*yesterday_trend + 
+                   SP500_close,
+                   sigma ~ daily_var) 
+
+
+
+```
+
+#Running models (With MI)
+```{r} 
+#______________________________________RUN MODELS______________________________________#
+warm_up <- 2000
+iter <- 5000
+cores_v <- 1
+chain_v <- 1
+
+###Non-aggregated models
+
+  #save all of the model names
+model_list <- c("m1_formula", "m2_formula", "m3_formula", "m4_formula", 
+                "m5_formula", "m6_formula", "m7_formula")
+
+  #run all the models at once and save the model and its performance metrics
+for (i in 1:length(model_list)){
+  #print progress
+  print(paste("running model ", i, " in ", length(model_list), sep = "")) 
+  
+  #run the model
+  model_formula <- get(model_list[i])
+  m <- brm(model_formula, 
+          data = complete_df,
+          family = gaussian(), 
+          cores = cores_v, chain = chain_v, warmup = warm_up, iter = iter)
+  
+  #save the model
+  assign(paste("m", i, sep = ""), m)
+  
+  #if there is an error save the variable, otherwise get performance metrics
+  if (class(m) == "try-error" | capture.output(m$fit) == "Stan model 'gaussian brms-model' does not contain samples."){
+    print("Try-error detected. Inserting NA's")
+    system(paste('say', paste("Model ", i, " had an error. Inserting NA.", sep="")))
+    
+    temp_df <- data.frame(modelnr = i,
+                      model_formula = model_list[i], 
+                      mean_eff.Sample = NA,
+                      mean_Rhat = NA,
+                      R2_Estimate = NA,
+                      rmse = NA
+                      )
+  } else{
+    print("The model was succesful. Calculating performance metrics, please be patient")
+    system(paste('say', paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep="")))
+    
+    sum <- try(summary(m))
+    BayesR2 <- try(bayes_R2(m))
+    predicted <- try(predict(m))
+
+    temp_df <- data.frame(modelnr = i,
+                        model_formula = model_list[i],  
+                        mean_eff.Sample = mean(sum$fixed[,5], na.rm = T),
+                        mean_Rhat = mean(sum$fixed[,6], na.rm = T),
+                        R2_Estimate = BayesR2[,1],
+                        rmse = Metrics::rmse(predicted[, 1], complete_df$daily_change)
+                        )
+  }
+  
+  #saving results
+  if (i == 1){
+    result_df <- temp_df
+  } else{
+    result_df <- rbind(result_df, temp_df)
+  }
+}
+
+
+###Aggregated models
+
+  #save all of the model names
+model_list.a <- c("m1_formula.a", "m2_formula.a", "m3_formula.a", "m4_formula.a", 
+                "m5_formula.a", "m6_formula.a", "m7_formula.a")
+
+  #the same loop as previously, just running all the aggregated models
+for (i in 1:length(model_list.a)){
+  # if (model_list.a[i] %in% result_df.a$model_formula){
+  #   next
+  # }
+  
+  #print progress
+  print(paste("(aggregated) running model ", i, " in ", length(model_list.a), sep = ""))
+  
+  #run the model
+  model_formula <- get(model_list.a[i])
+  m <- brm(model_formula, 
+          data = complete_df.a,
+          family = gaussian(), 
+          cores = cores_v, chain = chain_v, warmup = warm_up, iter = iter)
+  
+  #save the model
+  assign(paste("m", i, ".a", sep = ""), m)
+  
+  #if there is an error save the variable, otherwise get performance metrics
+  if (class(m) == "try-error" | capture.output(m$fit) == "Stan model 'gaussian brms-model' does not contain samples."){
+    print("(aggregated) Try-error detected. Inserting NA's")
+    system(paste('say', paste("Model ", i, " had an error. Inserting NA.", sep="")))
+    
+    temp_df <- data.frame(modelnr = i,
+                      model_formula = model_list.a[i], 
+                      mean_eff.Sample = NA,
+                      mean_Rhat = NA,
+                      R2_Estimate = NA,
+                      rmse = NA
+                      )
+  } else{
+    print("(aggregated) The model was succesful. Calculating performance metrics, please be patient")
+    system(paste('say', paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep="")))
+    
+    sum <- try(summary(m))
+    BayesR2 <- try(bayes_R2(m))
+    predicted <- try(predict(m))
+
+    temp_df <- data.frame(modelnr = i,
+                        model_formula = model_list.a[i],  
+                        mean_eff.Sample = mean(sum$fixed[,5], na.rm = T),
+                        mean_Rhat = mean(sum$fixed[,6], na.rm = T),
+                        R2_Estimate = BayesR2[,1],
+                        rmse = Metrics::rmse(predicted[, 1], complete_df.a$daily_change)
+                        )
+  }
+  
+  #saving results
+  if (i == 1){
+    result_df.a <- temp_df
+  } else{
+    result_df.a <- rbind(result_df.a, temp_df)
+  }
+}
+
+```
+
+#Running models (Using MICE)
+```{r}
+#______________________________________RUN MODELS______________________________________#
+warm_up <- 5000
+iter <- 10000
+cores_v <- 2
+chain_v <- 2
+
+###Non-aggregated models
+
+  #save all of the model names
+model_list.m <- c("m1_formula.m", "m2_formula.m", "m3_formula.m", "m4_formula.m", 
+                "m5_formula.m", "m6_formula.m", "m7_formula.m")
+
+  #run all the models at once and save the model and its performance metrics
+for (i in 1:length(model_list.m)){
+  #print progress
+  print(paste("(MICE) running model ", i, " in ", length(model_list.m), sep = "")) 
+  
+  #run the model
+  model_formula <- get(model_list.m[i])
+  m <- brm_multiple(model_formula, 
+          data = mice_complete_df,
+          family = gaussian(), 
+          cores = cores_v, chain = chain_v, warmup = warm_up, iter = iter)
+  
+  #save the model
+  assign(paste("m", i, ".a", sep = ""), m)
+  
+  #if there is an error save the variable, otherwise get performance metrics
+  if (capture.output(m$fit) == "Stan model 'gaussian brms-model' does not contain samples."){
+    print("Try-error detected. Inserting NA's")
+    system(paste('say', paste("Model ", i, " had an error. Inserting NA.", sep="")))
+    
+    temp_df <- data.frame(modelnr = i,
+                      model_formula = model_list.m[i], 
+                      mean_eff.Sample = NA,
+                      mean_Rhat = NA,
+                      R2_Estimate = NA,
+                      rmse = NA
+                      )
+  } else{
+    print("The model was succesful. Calculating performance metrics, please be patient")
+    system(paste('say', paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep="")))
+    
+    sum <- try(summary(m))
+    BayesR2 <- try(bayes_R2(m))
+    predicted <- try(predict(m))
+
+    temp_df <- data.frame(modelnr = i,
+                        model_formula = model_list.m[i],  
+                        mean_eff.Sample = mean(sum$fixed[,5], na.rm = T),
+                        mean_Rhat = mean(sum$fixed[,6], na.rm = T),
+                        R2_Estimate = BayesR2[,1],
+                        rmse = Metrics::rmse(predicted[, 1], complete_df$daily_change)
+                        )
+  }
+  
+  #saving results
+  if (i == 1){
+    result_df.m <- temp_df
+  } else{
+    result_df.m <- rbind(result_df.m, temp_df)
+  }
+}
+
+
+###Aggregated models
+
+  #save all of the model names
+model_list.a.m <- c("m1_formula.a.m", "m2_formula.a.m", "m3_formula.a.m", "m4_formula.a.m", 
+                "m5_formula.a.m", "m6_formula.a.m", "m7_formula.a.m")
+
+  #the same loop as previously, just running all the aggregated models
+for (i in 1:length(model_list.a.m)){
+  if (exists("result_df.a.m")){
+    if (model_list.a.m[i] %in% result_df.a.m$model_formula){
+     next
+   }
+  }
+
+  
+  
+  #print progress
+  print(paste("(MICE, aggregated) running model ", i, " in ", length(model_list.a.m), sep = ""))
+  
+  #run the model
+  model_formula <- get(model_list.a.m[i])
+  m <- brm_multiple(model_formula, 
+          data = mice_complete_df.a,
+          family = gaussian(), 
+          cores = cores_v, chains = chain_v, warmup = warm_up, iter = iter)
+
+  #save the model
+  assign(paste("m", i, ".a.m", sep = ""), m)
+  
+  #if there is an error save the variable, otherwise get performance metrics
+  if (capture.output(m$fit) == "Stan model 'gaussian brms-model' does not contain samples."){
+    print("(aggregated) Try-error detected. Inserting NA's")
+    system(paste('say', paste("Model ", i, " had an error. Inserting NA.", sep="")))
+    
+    temp_df <- data.frame(modelnr = i,
+                      model_formula = model_list.a.m[i], 
+                      mean_eff.Sample = NA,
+                      mean_Rhat = NA,
+                      R2_Estimate = NA,
+                      rmse = NA
+                      )
+  } else{
+    print("(aggregated) The model was succesful. Calculating performance metrics, please be patient")
+    system(paste('say', paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep="")))
+    
+    sum <- try(summary(m))
+    BayesR2 <- try(bayes_R2(m))
+    predicted <- try(predict(m))
+
+    temp_df <- data.frame(modelnr = i,
+                        model_formula = model_list.a.m[i],  
+                        mean_eff.Sample = mean(sum$fixed[,5], na.rm = T),
+                        mean_Rhat = mean(sum$fixed[,6], na.rm = T),
+                        R2_Estimate = BayesR2[,1],
+                        rmse = Metrics::rmse(complete_df.a$daily_change, predicted[, 1])
+                        )
+  }
+  
+  #saving results
+  if (i == 1){
+    result_df.a.m <- temp_df
+  } else{
+    result_df.a.m <- rbind(result_df.a.m, temp_df)
+  }
+}
+
+  
+predicted
+MAE <- sum(abs(complete_df.a$daily_change - predicted[, 1]))/length(complete_df.a$daily_change)
+RMSE <- sqrt(sum((complete_df.a$daily_change - predicted[, 1])^2)/length(complete_df.a$daily_change))
+```
+
+#Analysis with news sentiment aggregated
+```{r}
+
+#__________________________________COMBINE SENTIMENT__________________________________#
+comb_df <- select(complete_df.a, c("date", "daily_change", "btc_vs_mrkt_CSAD", "btc_vs_mrkt_trend",
+                                                 "crypto_CSAD", "crypto_trend", "yesterday_change", "yesterday_trend",
+                                                 "SP500_close", "daily_var", "media_trend", "media_CSAD"))
+
+comb_df$MSS <- NA
+for (i in 1:nrow(comb_df)){
+  comb_df$MSS[i] <- mean(c(complete_df.a$NYT_MSS[i], complete_df.a$CD_MSS[i],  complete_df.a$CNBC_MSS[i]), na.rm = T)
+}
+
+sum(is.nan(comb_df$MSS))
+
+comb_df$MSS[is.na(comb_df$MSS)] <- NA
+
+comb_df_non_scaled <- comb_df
+
+comb_df$media_CSAD <- scale(comb_df$media_CSAD)[,1]
+comb_df$btc_vs_mrkt_CSAD<- scale(comb_df$btc_vs_mrkt_CSAD)[,1]
+comb_df$crypto_CSAD <- scale(comb_df$crypto_CSAD)[,1]
+
+#______________________________________NEWS TREND_____________________________________#
+
+comb_df <- left_join(comb_df, 
+          select(get_trend(comb_df$date, comb_df$MSS), date, MSS_trend = trend), 
+          by = "date")
+
+
+#______________________________COMPUTING MISSSING VALUES______________________________#
+
+  #replacing trends NA's with 0 as these shouldn't be computes
+comb_df$media_trend[is.na(comb_df$media_trend)] <- 0
+
+  #names and names with missing values
+allVars <- names(comb_df)
+missVars <- names(comb_df)[colSums(is.na(comb_df)) > 0]
+
+  #creating predictor matrix
+predictorMatrix <- matrix(0, ncol = length(allVars), nrow = length(allVars))
+rownames(predictorMatrix) <- allVars
+colnames(predictorMatrix) <- allVars
+
+  #specifying variables for informed imputation
+imputerVars <- c("btc_vs_mrkt_CSAD", "btc_vs_mrkt_trend", "crypto_CSAD", "crypto_trend", "yesterday_change",
+                 "yesterday_trend","SP500_close", "media_trend", "media_CSAD", "MSS", "MSS_trend")
+
+imputerMatrix <- predictorMatrix
+imputerMatrix[,imputerVars] <- 1
+
+  #specifying values to be imputed
+imputedMatrix <- predictorMatrix
+imputedMatrix[missVars,] <- 1
+
+  #constructing final predictor matrix
+predictorMatrix <- imputerMatrix * imputedMatrix
+
+  #computing mice
+mice_comb_df <- mice(data = comb_df, predictorMatrix = predictorMatrix, print = F)
+
+
+
+#____________________________________DEFINE MODELS____________________________________#
+
+  #simple model
+m1_formula.c <- bf(daily_change ~ 1)
+
+    #previous day (and general market)
+m2_formula.c <- bf(daily_change ~ yesterday_change)
+
+  #only sentiment
+m3_formula.c <- bf(daily_change ~ MSS + media_CSAD)
+
+  #only herding
+m4_formula.c <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD) 
+
+  #market herding and sentiment
+m5_formula.c <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   MSS) 
+
+  #herding, sentiment, previous day and variance
+m6_formula.c <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   MSS + 
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula.c <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD + 
+                   crypto_CSAD +
+                   MSS*MSS_trend +
+                   media_CSAD +
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+  #m7 without media CSAD
+m8_formula.c <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD + 
+                   crypto_CSAD +
+                   MSS*MSS_trend +
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+  #m6 without media CSAD
+m9_formula.c <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + 
+                   MSS + 
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+#______________________________________RUN MODELS______________________________________#
+warm_up <- 4000
+iter <- 10000
+cores_v <- 2
+chain_v <- 2
+
+  #save all of the model names
+model_list.c <- c("m1_formula.c", "m2_formula.c", "m3_formula.c", "m4_formula.c", 
+                "m5_formula.c", "m6_formula.c", "m7_formula.c", "m8_formula.c", "m9_formula.c")
+
+with_media_CSAD = c(3, 5, 6, 7)
+
+  #the same loop as previously, just running all the aggregated models
+for (i in 1:length(model_list.c)){
+
+    #If the results are already there move on
+  if (exists("result_df.c")){if (model_list.c[i] %in% result_df.c$model_formula){next}}
+
+  if (i %in% with_media_CSAD){
+    prior <- c(prior(normal(0,0.2), class = b, coef = media_CSAD))
+  } else {prior <- NULL}
+    
+  #print progress
+  print(paste("Running model ", i, " in ", length(model_list.c), sep = ""))
+  
+  #run the model
+  model_formula <- get(model_list.c[i])
+  m <- brm_multiple(model_formula, 
+          data = mice_comb_df,
+          prior = prior,
+          family = gaussian(), 
+          cores = cores_v, chains = chain_v, warmup = warm_up, iter = iter)
+
+  #save the model
+  assign(paste("m", i, ".c", sep = ""), m)
+  
+  #if there is an error save the variable, otherwise get performance metrics
+  if (capture.output(m$fit) == "Stan model 'gaussian brms-model' does not contain samples."){
+    print("Try-error detected. Inserting NA's")
+    system(paste('say', paste("Model ", i, " had an error. Inserting NA.", sep="")))
+    
+    temp_df <- data.frame(modelnr = i,
+                      model_formula = model_list.c[i], 
+                      mean_eff.Sample = NA,
+                      mean_Rhat = NA,
+                      R2_Estimate = NA,
+                      rmse = NA
+                      )
+  } else{
+    print(paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep=""))
+    system(paste('say', paste("Model ", i, " was successful. Calculating performance metrics, please be patient.", sep="")))
+    
+    sum <- try(summary(m))
+    BayesR2 <- try(bayes_R2(m))
+    predicted <- try(predict(m))
+
+    temp_df <- data.frame(modelnr = i,
+                        model_formula = model_list.c[i],  
+                        mean_eff.Sample = mean(sum$fixed[,5], na.rm = T),
+                        max_Rhat = max(sum$fixed[,6], na.rm = T),
+                        R2_Estimate = BayesR2[,1],
+                        rmse = Metrics::rmse(complete_df.a$daily_change, predicted[, 1])
+                        )
+  }
+  
+  #saving results
+  if (i == 1){
+    result_df.c <- temp_df
+  } else{
+    result_df.c <- rbind(result_df.c, temp_df)
+  }
+}
+
+stanplot(m5.c)
+pp_check(m5.c)
+prior <- c(prior(normal(0,0.2), class = b, coef = media_CSAD))
+  #fixing issues with media CSAD
+
+
+  #herding, sentiment, previous day and variance
+m6_formula.v <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD + 
+                   MSS + 
+                   yesterday_change) 
+
+
+  #market herding, sentiment, previous day, variance and trends
+m7_formula.v <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD + 
+                   crypto_CSAD +
+                   MSS*MSS_trend +
+                   media_CSAD +
+                   yesterday_change) 
+
+m7.v <- brm_multiple(m7_formula.v, 
+        data = mice_comb_df,
+        family = gaussian(),
+        prior = prior,
+        cores = 2, chains = 2, warmup = 5000, iter = 20000)
+
+m6.v <- brm_multiple(m6_formula.v, 
+        data = mice_comb_df,
+        family = gaussian(),
+        prior = prior,
+        cores = 2, chains = 2, warmup = 5000, iter = 20000)
+
+m4.c
+ppm <- pp_check(m,nsamples = 100)
+ppm+ xlim(-100, 100)
+
+p1 <- pp_check(m1.c,nsamples = 100); p2 <- pp_check(m2.c,nsamples = 100); p3 <- pp_check(m3.c,nsamples = 100)
+p4 <- pp_check(m4.c,nsamples = 100); p5 <- pp_check(m5.c,nsamples = 100); p2 <- pp_check(m2.c,nsamples = 100)
+p2 <- pp_check(m2.c,nsamples = 100)
+
+(p1 + p2 + p3) / (p4 + p5)
+
+prior_summary(m6.c)
+m7.c
+
+pp_check(m2.c)+ xlim(-200, 200)
+
+  #Checking whether SP500 improves model fit.
+me1_formula.c <- bf(daily_change ~ yesterday_change)
+me2_formula.c <- bf(daily_change ~ yesterday_change + SP500_close)
+
+me1 <-  brm_multiple(me1_formula.c, 
+          data = mice_comb_df,
+          family = gaussian(), 
+          cores = cores_v, chains = chain_v, warmup = warm_up, iter = iter)
+
+me2 <-  brm_multiple(me2_formula.c, 
+          data = mice_comb_df,
+          family = gaussian(), 
+          cores = cores_v, chains = chain_v, warmup = warm_up, iter = iter)
+
+waic <- brms::WAIC(me1, me2)
+weights <- brms::model_weights(me1, me2, weights = "waic")
+
+
+  #Checking whether threeway interaction improves model fit.
+m7_formula <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD + 
+                   crypto_CSAD +
+                   MSS*MSS_trend +
+                   media_CSAD +
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+me7.1_formula <- bf(daily_change ~ 
+                   btc_vs_mrkt_CSAD + 
+                   crypto_CSAD +
+                   MSS*MSS_trend*media_CSAD +
+                   yesterday_change,
+                   sigma ~ daily_var) 
+
+###IT DOES NOT
+
+
+  #comparing with and without the media CSAD
+
+m4_formula <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD + media_CSAD) 
+m4.1_formula <- bf(daily_change ~ btc_vs_mrkt_CSAD + crypto_CSAD)
+
+m4 <-  brm_multiple(m4_formula, 
+          data = mice_comb_df,
+          prior = prior,
+          family = gaussian(),
+          cores = 1, chains = 1, warmup = 5000, iter = 10000)
+
+m4.1 <-  brm_multiple(m4.1_formula, 
+          data = mice_comb_df,
+          family = gaussian(),
+          cores = 1, chains = 1, warmup = 5000, iter = 10000)
+
+waic <- brms::WAIC(m4, m4.1)
+weights <- brms::model_weights(m4, m4.1, weights = "waic")
+
+#               WAIC     SE
+# m4        22886.98 508.13
+# m4.1      22887.92 509.24
+# m4 - m4.1    -0.94   1.50
+# weights
+#        m4      m4.1 
+# 0.6158123 0.3841877 
+#seems to improve fit
+
+
+```
+
+
